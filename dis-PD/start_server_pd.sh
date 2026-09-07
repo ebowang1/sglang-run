@@ -22,6 +22,19 @@
 #   组 B 全量   ：             bash start_server_pd.sh prefill 0        # 默认
 #   组 C EP隔离 ：IB_DEV=mlx5_bond_8 bash start_server_pd.sh prefill 0
 #   扩容 L1/L2  ：MEM_FRACTION=0.75 HICACHE_RATIO=3 bash start_server_pd.sh prefill 0
+#
+# ★坏卡剔除（BAD_HCA）：
+#   某些机器个别 HCA 的 index3 RoCE v2 GID 缺失/全零（体检方法见教程 §1.4.1：
+#   grep -H . /sys/class/infiniband/mlx5_bond_*/ports/1/gids/3）。
+#   把坏卡编号用逗号传给 BAD_HCA，脚本会自动从 NVSHMEM_HCA_LIST 与 NCCL_IB_HCA
+#   两套白名单中剔除，并校验 --disaggregation-ib-device 未落在坏卡上。
+#   实测结论：8 个 GPU 共享 6 张好卡即可跑通 DeepEP internode，
+#   因此【不需要】改 --tp/--dp/--ep-size，也【不需要】设 CUDA_VISIBLE_DEVICES。
+#
+#   例（D0=16 与 D1=143 坏 bond_2 / bond_5）：
+#     BAD_HCA=2,5 bash start_server_pd.sh decode 0     # 在 16 上
+#     BAD_HCA=2,5 bash start_server_pd.sh decode 1     # 在 143 上
+#   也可写全名：BAD_HCA=mlx5_bond_2,mlx5_bond_5
 
 set -euo pipefail
 
@@ -34,6 +47,8 @@ MODEL="${MODEL:-/data/models/GLM-5-FP8}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8998}"
 IB_DEV="${IB_DEV:-mlx5_bond_1}"         # ★变量：换 mlx5_bond_8 做 §2.4 组 C 隔离对照
 XFER_BACKEND="${XFER_BACKEND:-mooncake}"
+ALL_HCA_IDS="${ALL_HCA_IDS:-1 2 3 4 5 6 7 8}"   # 本机数据面 HCA 全集（mlx5_bond_N）
+BAD_HCA="${BAD_HCA:-}"                  # ★坏卡编号，逗号分隔，如 "2,5"
 
 # --- 可调容量参数（环境变量覆盖）---
 #   HICACHE      : on|off，仅 prefill 生效（off = §2.4 组 A 基线）
@@ -64,16 +79,94 @@ esac
 unset http_proxy https_proxy ftp_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY all_proxy ALL_PROXY || true
 cd /vllm-workspace && source .sglang_venv/bin/activate
 
+# --- ★按 BAD_HCA 生成好卡白名单（NVSHMEM 与 NCCL 两套都要，缺一不可）---
+# 说明：只从白名单剔除坏卡，GPU 仍用满 8 个（实测 8 GPU 共享 6 张好卡可跑通 EP）。
+is_bad_hca () {   # $1 = HCA 序号；返回 0=坏卡，1=好卡
+    local id="$1" b
+    if [ -z "${BAD_HCA}" ]; then
+        return 1
+    fi
+    for b in $(echo "${BAD_HCA}" | tr ',' ' '); do
+        b="${b#mlx5_bond_}"                       # 兼容传全名 mlx5_bond_2
+        if [ "${b}" = "${id}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+NVSHMEM_LIST=""; NCCL_LIST=""; GOOD_CNT=0
+for i in ${ALL_HCA_IDS}; do
+    dev="mlx5_bond_${i}"
+    if is_bad_hca "${i}"; then
+        echo "[hca] skip ${dev} (BAD_HCA)"
+        continue
+    fi
+    NVSHMEM_LIST="${NVSHMEM_LIST:+${NVSHMEM_LIST},}${dev}:1"
+    NCCL_LIST="${NCCL_LIST:+${NCCL_LIST},}${dev}"
+    GOOD_CNT=$((GOOD_CNT + 1))
+done
+
+if [ "${GOOD_CNT}" -eq 0 ]; then
+    echo "[err] 好卡数为 0，请检查 BAD_HCA / ALL_HCA_IDS"; exit 1
+fi
+
+# --disaggregation-ib-device 必须落在好卡上，否则 KV 传输握手失败或退化 socket
+if is_bad_hca "${IB_DEV#mlx5_bond_}"; then
+    echo "[err] IB_DEV=${IB_DEV} 在 BAD_HCA(${BAD_HCA}) 列表中，PD KV 传输会失败。"
+    echo "      请显式指定一张好卡，例如: IB_DEV=mlx5_bond_1"; exit 1
+fi
+
 # --- NVSHMEM / DeepEP 环境（跨机 EP 必需，四台都要）---
 export LD_PRELOAD=/usr/local/nvshmem/lib/libnvshmem_host.so.3
 export NVSHMEM_ENABLE_NIC_PE_MAPPING=0
-export NVSHMEM_HCA_LIST=mlx5_bond_1:1,mlx5_bond_2:1,mlx5_bond_3:1,mlx5_bond_4:1,mlx5_bond_5:1,mlx5_bond_6:1,mlx5_bond_7:1,mlx5_bond_8:1
+export NVSHMEM_HCA_LIST="${NVSHMEM_LIST}"
 unset NVSHMEM_HCA_PE_MAPPING || true
-export NVSHMEM_IB_GID_INDEX=3
+export NVSHMEM_IB_GID_INDEX="${GID_INDEX:-3}"
 
-# --- 若已在跑，先清理 ---
+# --- NCCL 同步收窄到同一批好卡（NCCL_IB_HCA 只管 NCCL，不影响 NVSHMEM）---
+export NCCL_IB_HCA="${NCCL_LIST}"
+export NCCL_IB_GID_INDEX="${GID_INDEX:-3}"
+
+echo "[hca] 好卡 ${GOOD_CNT} 张  NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST}"
+echo "[hca] NCCL_IB_HCA=${NCCL_IB_HCA}  GID_INDEX=${GID_INDEX:-3}"
+
+# --- ★好卡 GID 自检（GID_CHECK=0 可跳过）---
+# 目的：坏卡若漏进白名单，会在 EP 建 QP 时报 ibv_modify_qp failed / remote_gid=::，
+#      在这里提前拦住比等 watchdog 超时 300s 更省时间。
+if [ "${GID_CHECK:-1}" = "1" ]; then
+    bad_found=""
+    for d in $(echo "${NCCL_IB_HCA}" | tr ',' ' '); do
+        f="/sys/class/infiniband/${d}/ports/1/gids/${GID_INDEX:-3}"
+        if [ ! -e "${f}" ]; then
+            bad_found="${bad_found} ${d}(MISSING)"; continue
+        fi
+        g=$(cat "${f}" 2>/dev/null)
+        if [ "${g}" = "0000:0000:0000:0000:0000:0000:0000:0000" ]; then
+            bad_found="${bad_found} ${d}(ZERO)"
+        fi
+    done
+    if [ -n "${bad_found}" ]; then
+        echo "[err] 白名单中仍存在坏卡:${bad_found}"
+        echo "      请把它们加入 BAD_HCA 后重试，例如: BAD_HCA=2,5 bash $0 ${ROLE} ${NODE_RANK}"
+        exit 1
+    fi
+    echo "[hca] GID 自检通过（index ${GID_INDEX:-3} 全部有效）"
+fi
+
+# --- 若已在跑，先彻底清理 ---
+# ★必须清干净：残留进程会导致 Prometheus 指标重复注册
+#   （ValueError: Duplicated timeseries in CollectorRegistry），新实例直接启动失败。
 pkill -9 -f "sglang.launch_server" 2>/dev/null || true
-sleep 2
+pkill -9 -f "sglang::" 2>/dev/null || true
+pkill -9 -f "port ${PORT}" 2>/dev/null || true
+sleep 3
+if ss -lntp 2>/dev/null | grep -qE ":(${PORT}|5000|${BOOTSTRAP_PORT})\b"; then
+    echo "[warn] 端口仍被占用，再等 5s..."
+    ss -lntp 2>/dev/null | grep -E ":(${PORT}|5000|${BOOTSTRAP_PORT})\b"
+    pkill -9 -f sglang 2>/dev/null || true
+    sleep 5
+fi
 
 # --- 仅 prefill 组挂 HiCache 参数 ---
 HICACHE_ARGS=()

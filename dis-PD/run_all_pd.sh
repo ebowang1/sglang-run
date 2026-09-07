@@ -28,7 +28,7 @@ ROUTER_PORT="${ROUTER_PORT:-8000}"
 PLOG="${PLOG:-/tmp/prefill.log}"
 DLOG="${DLOG:-/tmp/decode.log}"
 RLOG="${RLOG:-/tmp/router.log}"
-AUTO="${AUTO:-/vllm-workspace/sglang-run/kv_profile_auto.py}"
+AUTO="${AUTO:-/vllm-workspace/sglang-run/dis-PD/kv_profile_auto.py}"
 READY_TIMEOUT="${READY_TIMEOUT:-1800}"   # 最长等 30 分钟（含 DeepGEMM warmup）
 
 cd /vllm-workspace && source .sglang_venv/bin/activate
@@ -97,7 +97,7 @@ fi
 # ---------- 5) 确认自动化脚本在位 ----------
 if [ ! -f "${AUTO}" ]; then
     echo "[err] 未找到 ${AUTO}"
-    echo "      请把 PD 分离目录下的 kv_profile_auto.py 放到 /vllm-workspace/sglang-run/"
+    echo "      请把 PD 分离目录下的 kv_profile_auto.py 放到 /vllm-workspace/sglang-run/dis-PD/"
     exit 1
 fi
 
