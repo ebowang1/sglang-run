@@ -35,6 +35,36 @@
 #     BAD_HCA=2,5 bash start_server_pd.sh decode 0     # 在 16 上
 #     BAD_HCA=2,5 bash start_server_pd.sh decode 1     # 在 143 上
 #   也可写全名：BAD_HCA=mlx5_bond_2,mlx5_bond_5
+#
+# ★HiSparse（分层稀疏 attention，仅 decode 生效）：
+#   用于测 decode 侧 swap-in/swap-out 与 EP low-latency 通信的冲突。
+#   代码依据（sglang/srt）：
+#     swap-in ：nsa_backend.py forward_decode → swap_in_selected_pages(layer_id)
+#               【每 decode step × 每层(78) × 每请求】，在【默认流】、
+#               且 page_table_1 是 attention 的直接输入 → 阻塞、无法被掩盖。
+#     swap-out：schedule_batch.py prepare_for_decode → map_last_loc_to_buffer
+#               → _eager_backup_previous_token 【每 decode step 每请求 1 token×78 层】，
+#               也在默认流，前面还有 wait_stream(decode_producer_stream) 同步点。
+#     staging ：admit_request_into_staging 一次性全量 backup（每请求 1 次），
+#               走独立 write_staging_stream；collect_ready_reqs 里带 TP all_reduce(MIN)。
+#   ⚠️ 开启后会强制把 NSA backend 改为 flashmla_sparse（server_args.py:1450），
+#      且校验层拒绝其他 backend（server_args.py:6197）。因此做 A/B 对照时，
+#      基线组必须显式 NSA_DECODE_BACKEND=flashmla_sparse，否则测出来的是
+#      "backend 差异"而不是 "swap 开销"。
+#
+#   config 字段与默认值（mem_cache/sparsity/factory.py:_parse_sparse_config）：
+#     top_k                2048        每层取多少 token 参与 sparse attention
+#     device_buffer_size   2*top_k     GPU 端 buffer 容量，必须 >= top_k
+#     host_to_device_ratio 2           host pool = device buffer 的倍数
+#   命中规律：seq_len <= device_buffer_size 时全部预载(几乎无 swap-in)；
+#            超过则每次 top-k 查找都 miss → 必须 host load（swap-in 流量最大）。
+#
+#   用法：
+#     HISPARSE=on bash start_server_pd.sh decode 0
+#     HISPARSE=on HISPARSE_TOPK=2048 HISPARSE_DEV_BUF=4096 bash start_server_pd.sh decode 0
+#     HISPARSE=on HISPARSE_CONFIG='{"top_k":512,"device_buffer_size":16384}' bash start_server_pd.sh decode 0
+#     # 基线组（不开 swap，但对齐 backend，用于纯净 A/B）：
+#     NSA_DECODE_BACKEND=flashmla_sparse bash start_server_pd.sh decode 0
 
 set -euo pipefail
 
@@ -56,6 +86,19 @@ BAD_HCA="${BAD_HCA:-}"                  # ★坏卡编号，逗号分隔，如 "
 #   MEM_FRACTION : L1 (GPU KV pool) 占比，按角色有不同默认值
 HICACHE="${HICACHE:-on}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
+
+# --- ★HiSparse 参数（仅 decode 生效）---
+#   HISPARSE        : on|off，默认 off
+#   HISPARSE_TOPK   : top_k，默认 2048
+#   HISPARSE_DEV_BUF: device_buffer_size，默认 2*top_k（必须 >= top_k）
+#   HISPARSE_H2D    : host_to_device_ratio，默认 2
+#   HISPARSE_CONFIG : 直接给完整 JSON，给了则忽略上面三个分项
+#   NSA_DECODE_BACKEND / NSA_PREFILL_BACKEND: 显式指定 NSA backend（做纯净 A/B 用）
+HISPARSE="${HISPARSE:-off}"
+HISPARSE_TOPK="${HISPARSE_TOPK:-2048}"
+HISPARSE_DEV_BUF="${HISPARSE_DEV_BUF:-}"
+HISPARSE_H2D="${HISPARSE_H2D:-2}"
+HISPARSE_CONFIG="${HISPARSE_CONFIG:-}"
 
 case "${ROLE}" in
   prefill)
@@ -196,11 +239,47 @@ if [ "${ROLE}" = "prefill" ]; then
     EXTRA_ARGS=(--chunked-prefill-size "${CHUNKED_PREFILL:-4096}")
 fi
 
+# --- ★HiSparse 参数（仅 decode 生效）---
+HISPARSE_ARGS=()
+HISPARSE_DESC="off"
+if [ "${ROLE}" = "decode" ] && [ "${HISPARSE}" = "on" ]; then
+    if [ -n "${HISPARSE_CONFIG}" ]; then
+        HS_CFG="${HISPARSE_CONFIG}"
+    else
+        # device_buffer_size 默认 2*top_k（代码默认），且必须 >= top_k
+        if [ -z "${HISPARSE_DEV_BUF}" ]; then
+            HISPARSE_DEV_BUF=$((HISPARSE_TOPK * 2))
+        fi
+        if [ "${HISPARSE_DEV_BUF}" -lt "${HISPARSE_TOPK}" ]; then
+            echo "[err] HISPARSE_DEV_BUF(${HISPARSE_DEV_BUF}) 必须 >= HISPARSE_TOPK(${HISPARSE_TOPK})"
+            exit 1
+        fi
+        HS_CFG="{\"top_k\":${HISPARSE_TOPK},\"device_buffer_size\":${HISPARSE_DEV_BUF},\"host_to_device_ratio\":${HISPARSE_H2D}}"
+    fi
+    HISPARSE_ARGS=(--enable-hisparse --hisparse-config "${HS_CFG}")
+    HISPARSE_DESC="on cfg=${HS_CFG}"
+fi
+
+# --- NSA backend 显式指定（做 hisparse A/B 时用于对齐基线）---
+# 不传则由 SGLang 自动选择；开 hisparse 时会被强制改为 flashmla_sparse。
+NSA_ARGS=()
+if [ -n "${NSA_DECODE_BACKEND:-}" ]; then
+    NSA_ARGS+=(--nsa-decode-backend "${NSA_DECODE_BACKEND}")
+fi
+if [ -n "${NSA_PREFILL_BACKEND:-}" ]; then
+    NSA_ARGS+=(--nsa-prefill-backend "${NSA_PREFILL_BACKEND}")
+fi
+
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
 if [ "${ROLE}" = "prefill" ]; then
     echo "[start] chunked-prefill-size=${CHUNKED_PREFILL:-4096}"
+else
+    echo "[start] hisparse=${HISPARSE_DESC}"
+fi
+if [ ${#NSA_ARGS[@]} -gt 0 ]; then
+    echo "[start] nsa: ${NSA_ARGS[*]}"
 fi
 
 nohup python -m sglang.launch_server \
@@ -216,6 +295,8 @@ nohup python -m sglang.launch_server \
     --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
     "${HICACHE_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
+    "${HISPARSE_ARGS[@]}" \
+    "${NSA_ARGS[@]}" \
     --page-size 64 \
     --mem-fraction-static "${MEM_FRACTION}" \
     --enable-metrics \
@@ -228,6 +309,14 @@ echo "[start] launched, pid=$!  tail -f ${LOG}"
 echo "[start] 成功标志: 'The server is fired up and ready to roll!'"
 echo ""
 echo "[hint] 若日志出现 'DeepEP error: timeout (dispatch CPU)' 且伴随 DeepGEMM JIT 编译，"
-echo "       说明 JIT 冷编译超过了 DeepEP 等待窗口。治本方式（每台跑一次，之后缓存复用）："
-echo "       python3 -m sglang.compile_deep_gemm --model ${MODEL} \\"
-echo "           --tp 16 --dp 4 --ep-size 16 --attention-backend nsa --trust-remote-code"
+echo "       说明 JIT 冷编译超过了 DeepEP 等待窗口。治本方式（同组两台同时跑一次）："
+echo "       bash \$(dirname \$0)/compile_deepgemm.sh <node_rank>"
+if [ "${ROLE}" = "decode" ]; then
+    echo ""
+    echo "[hint] hisparse A/B 对照（测 decode swap-in 与 EP low-latency 冲突）："
+    echo "       基线 A: NSA_DECODE_BACKEND=flashmla_sparse bash \$0 decode ${NODE_RANK}"
+    echo "       实验 B: HISPARSE=on bash \$0 decode ${NODE_RANK}"
+    echo "       扫变量: HISPARSE=on HISPARSE_DEV_BUF=16384 bash \$0 decode ${NODE_RANK}"
+    echo "       ★A 组必须显式对齐 backend，否则测到的是 backend 差异而非 swap 开销"
+    echo "       ★关注 TPOT(不是 TTFT)；trace 关键字 load_cache_to_device_buffer_mla"
+fi
