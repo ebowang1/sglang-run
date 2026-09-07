@@ -128,8 +128,19 @@ export NVSHMEM_IB_GID_INDEX="${GID_INDEX:-3}"
 export NCCL_IB_HCA="${NCCL_LIST}"
 export NCCL_IB_GID_INDEX="${GID_INDEX:-3}"
 
+# --- ★DeepEP 超时放宽（实测必需）---
+# 背景：deep_ep/buffer.py 中 CPU 侧默认超时仅 100s（下限也是 100）。
+#   首次跑真实请求时会撞上 DeepGEMM JIT 冷编译（日志提示"通常 10-20 分钟"），
+#   部分 rank 仍在编译、未进入 dispatch，已到达的 rank 等不到就报
+#   "RuntimeError: DeepEP error: timeout (dispatch CPU)" → scheduler exit -3 → SIGQUIT。
+#   实测：13:20:30 进 JIT，13:22:11 报错，间隔 101s，正好卡在 100s 阈值。
+# 治本仍是 §预编译（见脚本末尾提示），此处放宽只是兜底。
+export DEEPEP_NUM_CPU_TIMEOUT_SECONDS="${DEEPEP_CPU_TIMEOUT:-1800}"
+export DEEPEP_NUM_GPU_TIMEOUT_CYCLES_IN_BILLIONS="${DEEPEP_GPU_TIMEOUT:-800}"
+
 echo "[hca] 好卡 ${GOOD_CNT} 张  NVSHMEM_HCA_LIST=${NVSHMEM_HCA_LIST}"
 echo "[hca] NCCL_IB_HCA=${NCCL_IB_HCA}  GID_INDEX=${GID_INDEX:-3}"
+echo "[deepep] CPU_TIMEOUT=${DEEPEP_NUM_CPU_TIMEOUT_SECONDS}s  GPU_TIMEOUT=${DEEPEP_NUM_GPU_TIMEOUT_CYCLES_IN_BILLIONS}G cycles"
 
 # --- ★好卡 GID 自检（GID_CHECK=0 可跳过）---
 # 目的：坏卡若漏进白名单，会在 EP 建 QP 时报 ibv_modify_qp failed / remote_gid=::，
@@ -178,14 +189,19 @@ if [ "${ROLE}" = "prefill" ] && [ "${HICACHE}" = "on" ]; then
 fi
 
 # --- 仅 prefill 组需要 chunked-prefill 调优 ---
+# 默认 4096（与 SGLang 默认一致）；需要拉大单卡 prefill token 数时显式指定，例如：
+#   CHUNKED_PREFILL=16384 bash start_server_pd.sh prefill 0
 EXTRA_ARGS=()
 if [ "${ROLE}" = "prefill" ]; then
-    EXTRA_ARGS=(--chunked-prefill-size "${CHUNKED_PREFILL:-16384}")
+    EXTRA_ARGS=(--chunked-prefill-size "${CHUNKED_PREFILL:-4096}")
 fi
 
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
+if [ "${ROLE}" = "prefill" ]; then
+    echo "[start] chunked-prefill-size=${CHUNKED_PREFILL:-4096}"
+fi
 
 nohup python -m sglang.launch_server \
     --model-path "${MODEL}" \
@@ -210,3 +226,8 @@ nohup python -m sglang.launch_server \
 
 echo "[start] launched, pid=$!  tail -f ${LOG}"
 echo "[start] 成功标志: 'The server is fired up and ready to roll!'"
+echo ""
+echo "[hint] 若日志出现 'DeepEP error: timeout (dispatch CPU)' 且伴随 DeepGEMM JIT 编译，"
+echo "       说明 JIT 冷编译超过了 DeepEP 等待窗口。治本方式（每台跑一次，之后缓存复用）："
+echo "       python3 -m sglang.compile_deep_gemm --model ${MODEL} \\"
+echo "           --tp 16 --dp 4 --ep-size 16 --attention-backend nsa --trust-remote-code"
