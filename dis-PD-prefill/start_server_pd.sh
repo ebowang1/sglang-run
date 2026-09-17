@@ -87,6 +87,11 @@ BAD_HCA="${BAD_HCA:-}"                  # ★坏卡编号，逗号分隔，如 "
 HICACHE="${HICACHE:-on}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
 
+# --- 调试开关：跳过启动 warmup ---
+#   SKIP_WARMUP: 1|0，默认 0。设 1 时加 --skip-server-warmup 跳过启动自检预热。
+#   用途：warmup 路径本身崩（如 cudaErrorInvalidValue）时先绕过，让服务起来接真实请求做隔离。
+SKIP_WARMUP="${SKIP_WARMUP:-0}"
+
 # --- ★HiSparse 参数（仅 decode 生效）---
 #   HISPARSE        : on|off，默认 off
 #   HISPARSE_TOPK   : top_k，默认 2048
@@ -239,6 +244,12 @@ if [ "${ROLE}" = "prefill" ]; then
     EXTRA_ARGS=(--chunked-prefill-size "${CHUNKED_PREFILL:-4096}")
 fi
 
+# --- 调试：跳过 warmup ---
+WARMUP_ARGS=()
+if [ "${SKIP_WARMUP}" = "1" ]; then
+    WARMUP_ARGS=(--skip-server-warmup)
+fi
+
 # --- ★HiSparse 参数（仅 decode 生效）---
 HISPARSE_ARGS=()
 HISPARSE_DESC="off"
@@ -273,6 +284,9 @@ fi
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
+if [ "${SKIP_WARMUP}" = "1" ]; then
+    echo "[start] ★SKIP_WARMUP=1 已加 --skip-server-warmup（跳过启动预热）"
+fi
 if [ "${ROLE}" = "prefill" ]; then
     echo "[start] chunked-prefill-size=${CHUNKED_PREFILL:-4096}"
 else
@@ -295,6 +309,7 @@ nohup python -m sglang.launch_server \
     --disaggregation-bootstrap-port "${BOOTSTRAP_PORT}" \
     "${HICACHE_ARGS[@]}" \
     "${EXTRA_ARGS[@]}" \
+    "${WARMUP_ARGS[@]}" \
     "${HISPARSE_ARGS[@]}" \
     "${NSA_ARGS[@]}" \
     --page-size 64 \
