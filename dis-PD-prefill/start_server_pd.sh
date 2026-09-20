@@ -110,6 +110,19 @@ HISPARSE_DEV_BUF="${HISPARSE_DEV_BUF:-}"
 HISPARSE_H2D="${HISPARSE_H2D:-2}"
 HISPARSE_CONFIG="${HISPARSE_CONFIG:-}"
 
+# --- max-running-requests（可覆盖）---
+# ★开 HiSparse 时务必调小：HiSparse 的 req_to_host_pool 张量形状是
+#   (max_running_requests, max_context_len=202752) int64，在 GPU 上分配，
+#   128 → 约 207GB 直接 OOM(cudaErrorInvalidValue)。开 HiSparse 建议 MAX_RUNNING=2~8。
+MAX_RUNNING="${MAX_RUNNING:-128}"
+
+# --- context-length（可覆盖，默认不设=用模型原值 202752）---
+# ★开 HiSparse 时强烈建议调小：req_to_host_pool 列数=context_len，
+#   它 = max_running_requests × context_len × 8B 在 GPU 上预留（按最坏情况满额）。
+#   测 HiSparse 请求仅 8k~16k，设 CONTEXT_LEN=32768 即可，能把该表缩小 6 倍，
+#   从而支持更大的 MAX_RUNNING（batch）。例：CONTEXT_LEN=32768 MAX_RUNNING=64。
+CONTEXT_LEN="${CONTEXT_LEN:-}"
+
 case "${ROLE}" in
   prefill)
     PORT="${PORT:-30000}"
@@ -286,6 +299,12 @@ if [ -n "${NSA_PREFILL_BACKEND:-}" ]; then
     NSA_ARGS+=(--nsa-prefill-backend "${NSA_PREFILL_BACKEND}")
 fi
 
+# --- context-length 参数（设了才加）---
+CTX_ARGS=()
+if [ -n "${CONTEXT_LEN}" ]; then
+    CTX_ARGS=(--context-length "${CONTEXT_LEN}")
+fi
+
 echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
@@ -299,6 +318,9 @@ else
 fi
 if [ ${#NSA_ARGS[@]} -gt 0 ]; then
     echo "[start] nsa: ${NSA_ARGS[*]}"
+fi
+if [ -n "${CONTEXT_LEN}" ]; then
+    echo "[start] context-length=${CONTEXT_LEN}  max-running-requests=${MAX_RUNNING}"
 fi
 
 nohup python -m sglang.launch_server \
@@ -317,11 +339,12 @@ nohup python -m sglang.launch_server \
     "${WARMUP_ARGS[@]}" \
     "${HISPARSE_ARGS[@]}" \
     "${NSA_ARGS[@]}" \
+    "${CTX_ARGS[@]}" \
     --page-size 64 \
     --mem-fraction-static "${MEM_FRACTION}" \
     --enable-metrics \
     --enable-request-time-stats-logging \
-    --max-running-requests 128 \
+    --max-running-requests "${MAX_RUNNING}" \
     --host 0.0.0.0 --port "${PORT}" \
     > "${LOG}" 2>&1 &
 
