@@ -3,7 +3,8 @@
 #   等 P/D/Router 三方就绪 -> 确认 hisparse 生效 -> 冒烟验 KV 链路 -> 跑 decode 并发压测(+可选 profile)。
 #
 # 前提：
-#   1) 四台已各自 bash start_server_pd.sh <role> <node_rank>（D 侧默认已开 hisparse）；
+#   1) 四台已各自 bash ../dis-PD-prefill/start_server_pd.sh <role> <node_rank>；
+#      D 侧要测 hisparse 则加 HISPARSE=on（启动脚本已统一到 dis-PD-prefill 目录）；
 #   2) P0 已 bash start_router.sh。
 #
 # ★与 dis-PD-prefill/run_all_pd.sh 的差异：
@@ -69,7 +70,7 @@ if grep -qE 'enable_hisparse=True' "${DLOG}" 2>/dev/null; then
     echo "  [ok] ★hisparse 已在 decode 侧启用"
 else
     echo "  [warn] ★未在 ${DLOG} 检测到 enable_hisparse=True！"
-    echo "         若你是想测 hisparse ON，请确认 D 侧用本目录 start_server_pd.sh 启动（默认 on）。"
+    echo "         若你是想测 hisparse ON，请确认 D 侧用 HISPARSE=on ../dis-PD-prefill/start_server_pd.sh 启动。"
     echo "         若你是在跑 A/B 的 OFF 基线组，请忽略本警告。"
 fi
 

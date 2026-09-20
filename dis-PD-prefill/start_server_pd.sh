@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # 启动 GLM-5 四机 32 卡 PD 分离（2 Prefill + 2 Decode，每台各执行一次）。
 #
+# ★本脚本是 PD 分离的【唯一】启动入口，同时管 prefill / decode 两个角色（由第 1 个参数 role 决定）。
+#   原先的 dis-PD-decode/start_server_pd.sh 已合并进本脚本：decode 侧要开 hisparse，只需加 HISPARSE=on。
+#
 # 用法：
 #   P0 (29.209.115.238):  bash start_server_pd.sh prefill 0
 #   P1 (29.209.114.88) :  bash start_server_pd.sh prefill 1
-#   D0 (29.209.104.16) :  bash start_server_pd.sh decode  0
+#   D0 (29.209.104.16) :  bash start_server_pd.sh decode  0                 # 不开 hisparse
 #   D1 (29.209.105.143):  bash start_server_pd.sh decode  1
+#   # decode 开 hisparse（原 dis-PD-decode 目录的默认行为）：
+#   D0/D1:  HISPARSE=on bash start_server_pd.sh decode 0/1
 #
 # ⚠️ 启动顺序：Prefill 组必须先于 Decode 组（D 组要连 P 组 head 的 8998 bootstrap）。
 #    worker 可以先起（会等本组 head）。
