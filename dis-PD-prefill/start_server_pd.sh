@@ -116,6 +116,12 @@ HISPARSE_CONFIG="${HISPARSE_CONFIG:-}"
 #   128 → 约 207GB 直接 OOM(cudaErrorInvalidValue)。开 HiSparse 建议 MAX_RUNNING=2~8。
 MAX_RUNNING="${MAX_RUNNING:-128}"
 
+# --- ★DP size（可覆盖，默认 4）---
+# 用于对照实验：dp4=每 DP 组 4 卡；dp2=每 DP 组 8 卡(整机一组)；dp1=全 16 卡一组。
+# 注意 tp16/ep16 不变，仅改 attention 的 DP 分组，用于排查 HiSparse 与
+# DeepEP/NVSHMEM 在不同 DP 布局下的 GPU 资源冲突（哪些卡崩是否随 DP 分组变化）。
+DP_SIZE="${DP_SIZE:-4}"
+
 # --- context-length（可覆盖，默认不设=用模型原值 202752）---
 # ★开 HiSparse 时强烈建议调小：req_to_host_pool 列数=context_len，
 #   它 = max_running_requests × context_len × 8B 在 GPU 上预留（按最坏情况满额）。
@@ -305,7 +311,7 @@ if [ -n "${CONTEXT_LEN}" ]; then
     CTX_ARGS=(--context-length "${CONTEXT_LEN}")
 fi
 
-echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} -> ${LOG}"
+echo "[start] role=${ROLE} node_rank=${NODE_RANK} dist-init=${HEAD}:5000 port=${PORT} dp=${DP_SIZE} -> ${LOG}"
 echo "[start] mem-fraction=${MEM_FRACTION} hicache=${HICACHE}(ratio=${HICACHE_RATIO})"
 echo "[start] pd: backend=${XFER_BACKEND} ib=${IB_DEV} bootstrap=${BOOTSTRAP_PORT}"
 if [ "${SKIP_WARMUP}" = "1" ]; then
@@ -326,7 +332,7 @@ fi
 nohup python -m sglang.launch_server \
     --model-path "${MODEL}" \
     --trust-remote-code \
-    --tp 16 --dp 4 --enable-dp-attention \
+    --tp 16 --dp "${DP_SIZE}" --enable-dp-attention \
     --ep-size 16 --moe-a2a-backend deepep \
     --attention-backend nsa \
     --nnodes 2 --node-rank "${NODE_RANK}" --dist-init-addr "${HEAD}:5000" \
